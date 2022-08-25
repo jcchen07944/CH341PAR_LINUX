@@ -21,7 +21,8 @@
 #include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/kref.h>
-#include <asm/uaccess.h>
+#include <linux/sched.h>
+#include <linux/uaccess.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 
@@ -37,13 +38,13 @@
 
 #ifdef DEBUG
 #define dbg( format, arg... )	\
-    printk( KERN_DEBUG "%s %d: " format "\n", __FILE__, __LINE__, ##arg )
+    printk( "Debug: %s %d: " format "\n", __func__, __LINE__, ##arg )
 #else
 #define dbg( format, arg... )	do{} while(0)
 #endif
 
 #define err( format, arg... )	\
-    printk( KERN_ERR KBUILD_MODNAME ":" format "\n", __FILE__, __LINE__, ##arg)
+    printk("Error: %s %d: " format "\n", __func__, __LINE__, ##arg)
 
 
 #define CH34x_VENDOR_ID		0x1A86	//Vendor Id
@@ -265,25 +266,31 @@ ssize_t ch34x_fops_read(struct file *file, char __user *to_user,
 	size_t count, loff_t *file_pos)
 {
 	struct ch34x_pis *dev;
-	unsigned char mBuffer[4];
+	unsigned char *mBuffer = NULL;
 	int retval, i;
 	int j = 0;
-	unsigned long bytes_read, mNewlen, Returnlen;
-	unsigned long Bytes, totallen = 0;
+	int bytes_read, mNewlen, Returnlen;
+	unsigned long Bytes, totallen = 0UL;
 
 	dev = (struct ch34x_pis *)file->private_data;
 	if( count == 0 || count > MAX_BUFFER_LENGTH )
 	{
 		return count;		
 	} 
-	bytes_read = ( dev->VenIc >= 0x20 )?( CH34xA_EPP_IO_MAX - 
-		(CH34xA_EPP_IO_MAX & ( CH34x_PACKET_LENGTH - 1 ))): CH34x_EPP_IO_MAX;
+	bytes_read = CH34x_EPP_IO_MAX;
 	
 	mNewlen = count / bytes_read;
+	mBuffer = (unsigned char *) kmalloc(4 * sizeof(unsigned char), GFP_KERNEL);
+	if( mBuffer == NULL )
+	{
+		err("mBuffer malloc error");
+		retval = -ENOMEM;
+		goto exit;
+	}
 	mBuffer[0] = mBuffer[2] = Read_Mode;
 	mBuffer[1] = ( unsigned char )bytes_read;
 	mBuffer[3] = ( unsigned char )( count - mNewlen * bytes_read );
-	dbg("count %d,->bytes_read %d,->mNewlen %d,->mBuffer[0] %d,->[1] %d,->[2]%d,->[3]%d",count,bytes_read,mNewlen,mBuffer[0],mBuffer[1],mBuffer[2],mBuffer[3]);
+	dbg("count = %d, bytes_read = %d, mNewlen = %d, mBuffer[0] = %d, mBuffer[1] = %d, mBuffer[2] = %d, mBuffer[3] = %d",count,bytes_read,mNewlen,mBuffer[0],mBuffer[1],mBuffer[2],mBuffer[3]);
 	
 	if( mBuffer[3] )
 		mNewlen++;
@@ -320,9 +327,9 @@ ssize_t ch34x_fops_read(struct file *file, char __user *to_user,
 			dev->bulk_out_endpointAddr ), mBuffer + j, 0x02, NULL, 10000);
 		if( retval )
 		{
+			err("usb_bulk_msg out error (%d)", retval);
 			retval = -EFAULT;
 			mutex_unlock( &io_mutex );
-			err("usb_bulk_msg out error");
 			goto exit;
 		}
 		mutex_unlock( &io_mutex );
@@ -342,13 +349,14 @@ ssize_t ch34x_fops_read(struct file *file, char __user *to_user,
 		mutex_unlock( &io_mutex );
 		totallen += Returnlen;
 	}
-	
 	if( copy_to_user( to_user, dev->bulk_in_buffer, totallen ))
 		retval = -EFAULT;
 	else
 		retval = totallen;		
 	kfree( dev->bulk_in_buffer );
-exit:	
+exit:
+	if (mBuffer != NULL)
+		kfree(mBuffer);
 	return retval;
 }
 
@@ -361,7 +369,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 	char *WriteBuf = NULL;
 	char *buf;
 	struct urb *urb = NULL;
-	unsigned int i;
+	unsigned int i, j;
 	unsigned long mLength, mNewlen, mReturn = 0;	
 	unsigned long write_size;
 
@@ -392,13 +400,23 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 	for( i = 0; i < mNewlen; i += CH34x_PACKET_LENGTH )
 	{
 		buf[i] = Write_Mode;
-		memcpy( buf + i + 1, user_buffer + mReturn, CH34x_EPP_IO_MAX );
+		if (copy_from_user( buf + i + 1, user_buffer + mReturn, CH34x_EPP_IO_MAX ))
+		{
+			dbg("copy_from_user error.");
+			retval = -ENOMEM;
+			goto error;
+		}
 		mReturn += CH34x_EPP_IO_MAX;
 	}
 	if( mLength )
 	{
 		buf[i] = Write_Mode;
-		memcpy( buf + i + 1, user_buffer + mReturn, mLength );
+		if (copy_from_user( buf + i + 1, user_buffer + mReturn, mLength ))
+		{
+			dbg("copy_from_user error.");
+			retval = -ENOMEM;
+			goto error;
+		}
 		mNewlen += mLength + 1 ;
 	}
 	mutex_unlock( &io_mutex );
@@ -426,11 +444,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 			goto error;
 		}	
 		
-		if( copy_from_user( WriteBuf, buf, write_size ))
-		{
-			retval = -EFAULT;
-			goto error;
-		}
+		memcpy( WriteBuf, buf, write_size );
 		
 		mutex_lock( &io_mutex );
 		if( !dev->interface )
@@ -482,12 +496,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 		goto error;
 	}
 
-	if( __copy_from_user( WriteBuf + ( mNewlen - mLength), (unsigned char __user*)buf + (mNewlen - mLength), mLength ))
-	{
-		retval = -EFAULT;
-		dbg("copy_from_user error");
-		goto error;
-	}
+	memcpy( WriteBuf + ( mNewlen - mLength), buf + (mNewlen - mLength), mLength );
 	mutex_lock( &io_mutex );
 	if( !dev->interface )
 	{
@@ -853,7 +862,7 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 {
 	int err = 0;
 	int retval = 0;
-	char buf[2];
+	char *buf = NULL;
 	unsigned long bytes_read;
 	unsigned long bytes_write;
 	char *drv_version_tmp = DRV_VERSION;
@@ -875,6 +884,11 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 			}
 		case CH34x_CHIP_VERSION:
 			{
+                buf = (char *) kmalloc(2 * sizeof(char), GFP_KERNEL);
+                if (buf == NULL)
+                {
+                    return -ENOMEM;
+                }
 				retval = ch34x_func_read( VENDOR_VERSION, 
 				0x0000, 0x0000, ch34x_pis_tmp, buf, 0x02 );			
 				
@@ -882,6 +896,7 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 					(char *)buf, 0x02 );	
 				ch34x_pis_tmp->VenIc = buf[1] << 8 | buf[0];
 				dbg("------> 2 Chip Version is sucessful 0x%02x%x", buf[1],buf[0]);
+                kfree(buf);
 				break;
 			}
 		case CH34x_FUNCTION_SETPARA_MODE:
@@ -891,7 +906,7 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 					ch34x_pis_tmp, NULL, 0x00 );
 				if( retval != 0 )
 					err("CH34x_FUNCTION_SETPARA_MODE Error");
-				dbg("------>SetParaMode - ch34x_arg %x", ch34x_arg);
+				dbg("SetParaMode - ch34x_arg %x", ch34x_arg);
 				break;
 			}
 		case CH34x_FUNCTION_READ_MODE:
@@ -901,7 +916,7 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 				else
 					Read_Mode = CH34x_PARA_CMD_R0;
 
-				dbg( "---->Read_Mode : 0x%x", Read_Mode );
+				dbg( "Read_Mode : 0x%x", Read_Mode );
 				break;
 			}
 		case CH34x_FUNCTION_WRITE_MODE:
